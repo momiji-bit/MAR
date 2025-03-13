@@ -1,0 +1,9 @@
+.idea/
+/Datasets/MA52-pose44/
+/Datasets/MA52-pose151/
+/SkateFormer/output/
+/SkateFormer/gifs/
+*.pt
+*.pdf
+*.pkl
+*.mp4

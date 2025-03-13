@@ -1,0 +1,83 @@
+# command line: main.py
+
+base_lr: 0.001
+batch_size: 288
+config: ./config/SkateFormer_4w_j_NEW.yaml
+device:
+- 0
+- 1
+- 2
+- 3
+eval_interval: 5
+feeder: feeders.feeder_ma52_NEW.Feeder
+grad_clip: true
+grad_max: 1.0
+ignore_weights: []
+log_interval: 100
+loss_type: LSCE
+lr_decay_rate: 0.1
+lr_ratio: 0.001
+lr_scheduler: cosine
+min_lr: 1.0e-05
+model: model.SkateFormer_4w.SkateFormer_
+model_args:
+  attn_drop: 0.5
+  drop_path: 0.2
+  head_drop: 0.0
+  in_channels: 2
+  index_t: true
+  kernel_size: 7
+  mlp_ratio: 1.0
+  num_classes: 52
+  num_heads: 32
+  num_people: 1
+  num_points: 48
+  rel: true
+  type_1_size:
+  - 8
+  - 12
+  type_2_size:
+  - 8
+  - 24
+  type_3_size:
+  - 8
+  - 12
+  type_4_size:
+  - 8
+  - 24
+model_saved_name: ''
+nesterov: true
+num_epoch: 100
+num_worker: 6
+optimizer: AdamW
+phase: train
+print_log: true
+save_epoch: 30
+save_interval: 1
+save_score: false
+seed: 1
+show_topk:
+- 1
+- 5
+start_epoch: 0
+test_batch_size: 288
+test_feeder_args:
+  data_path: new_ma52/json
+  data_type: j
+  label_path: val
+  partition: true
+  repeat: 1
+train_feeder_args:
+  data_path: new_ma52/json
+  data_type: j
+  debug: false
+  label_path: train
+  p: 0.3
+  partition: true
+  repeat: 10
+warm_up_epoch: 25
+warmup_lr: 1.0e-07
+warmup_prefix: false
+weight_decay: 0.1
+weights: null
+work_dir: ./output/original_48_4w/

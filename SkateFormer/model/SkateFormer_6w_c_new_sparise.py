@@ -1,0 +1,503 @@
+from typing import Type, Tuple, Optional, Set, List, Union
+
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from timm.models.layers import drop_path, trunc_normal_, Mlp, DropPath, create_act_layer, get_norm_act_layer, \
+    create_conv2d
+
+''' Partition and Reverse (分块与反分块) '''
+
+
+# 原代码中的 partition 函数保留，如有其他用途可继续使用
+def type_1_partition(input, partition_size):  # partition_size = [N, L]
+    B, C, T, V = input.shape
+    partitions = input.view(B, C, T // partition_size[0], partition_size[0], V // partition_size[1], partition_size[1])
+    partitions = partitions.permute(0, 2, 4, 3, 5, 1).contiguous().view(-1, partition_size[0], partition_size[1], C)
+    return partitions
+
+
+def type_1_reverse(partitions, original_size, partition_size):  # original_size = [T, V]
+    T, V = original_size
+    B = int(partitions.shape[0] / (T * V / partition_size[0] / partition_size[1]))
+    output = partitions.view(B, T // partition_size[0], V // partition_size[1], partition_size[0], partition_size[1],
+                             -1)
+    output = output.permute(0, 5, 1, 3, 2, 4).contiguous().view(B, -1, T, V)
+    return output
+
+
+def type_2_partition(input, partition_size):  # partition_size = [N, K]
+    B, C, T, V = input.shape
+    partitions = input.view(B, C, T // partition_size[0], partition_size[0], partition_size[1], V // partition_size[1])
+    partitions = partitions.permute(0, 2, 5, 3, 4, 1).contiguous().view(-1, partition_size[0], partition_size[1], C)
+    return partitions
+
+
+def type_2_reverse(partitions, original_size, partition_size):  # original_size = [T, V]
+    T, V = original_size
+    B = int(partitions.shape[0] / (T * V / partition_size[0] / partition_size[1]))
+    output = partitions.view(B, T // partition_size[0], V // partition_size[1], partition_size[0], partition_size[1],
+                             -1)
+    output = output.permute(0, 5, 1, 3, 4, 2).contiguous().view(B, -1, T, V)
+    return output
+
+
+def type_3_partition(input, partition_size):  # partition_size = [M, L]
+    B, C, T, V = input.shape
+    partitions = input.view(B, C, partition_size[0], T // partition_size[0], V // partition_size[1], partition_size[1])
+    partitions = partitions.permute(0, 3, 4, 2, 5, 1).contiguous().view(-1, partition_size[0], partition_size[1], C)
+    return partitions
+
+
+def type_3_reverse(partitions, original_size, partition_size):  # original_size = [T, V]
+    T, V = original_size
+    B = int(partitions.shape[0] / (T * V / partition_size[0] / partition_size[1]))
+    output = partitions.view(B, T // partition_size[0], V // partition_size[1], partition_size[0], partition_size[1],
+                             -1)
+    output = output.permute(0, 5, 3, 1, 2, 4).contiguous().view(B, -1, T, V)
+    return output
+
+
+def type_4_partition(input, partition_size):  # partition_size = [M, K]
+    B, C, T, V = input.shape
+    partitions = input.view(B, C, partition_size[0], T // partition_size[0], partition_size[1], V // partition_size[1])
+    partitions = partitions.permute(0, 3, 5, 2, 4, 1).contiguous().view(-1, partition_size[0], partition_size[1], C)
+    return partitions
+
+
+def type_4_reverse(partitions, original_size, partition_size):  # original_size = [T, V]
+    T, V = original_size
+    B = int(partitions.shape[0] / (T * V / partition_size[0] / partition_size[1]))
+    output = partitions.view(B, T // partition_size[0], V // partition_size[1], partition_size[0], partition_size[1],
+                             -1)
+    output = output.permute(0, 5, 3, 1, 4, 2).contiguous().view(B, -1, T, V)
+    return output
+
+
+''' 以下是稀疏自注意力模块的实现 (Sparse Self-Attention Module) '''
+
+
+class SparseSelfAttention(nn.Module):
+    def __init__(self, in_channels, num_heads=8, window_size=7, attn_drop=0.):
+        """
+        in_channels: 输入通道数 (input channels)
+        num_heads: 注意力头数 (number of attention heads)
+        window_size: 局部窗口大小，只有相对位置差值不超过此值的token之间互相计算注意力 (local window size; only tokens within this distance attend to each other)
+        attn_drop: 注意力丢弃率 (attention dropout rate)
+        """
+        super(SparseSelfAttention, self).__init__()
+        self.in_channels = in_channels
+        self.num_heads = num_heads
+        self.window_size = window_size  # 稀疏窗口大小 (sparse window size)
+        self.head_dim = in_channels // num_heads
+        assert self.head_dim * num_heads == in_channels, "in_channels必须能被num_heads整除 (in_channels must be divisible by num_heads)"
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(in_channels, in_channels * 3, bias=True)
+        self.proj = nn.Linear(in_channels//3, in_channels//3)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj_drop = nn.Dropout(attn_drop)
+
+    def forward(self, x):
+        # 输入 x: [B, N, C] 其中 N=T*V (B=batch, N=序列长度, C=通道数)
+        B, N, C = x.shape
+        qkv = x.reshape(B, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        q = q * self.scale
+        attn = torch.matmul(q, k.transpose(-2, -1))  # [B, num_heads, N, N]
+
+        # 构造局部稀疏掩码 (construct local sparse mask)
+        idxs = torch.arange(N, device=x.device)
+        mask = (idxs.unsqueeze(0) - idxs.unsqueeze(1)).abs()  # [N, N]
+        sparse_mask = (mask > self.window_size).float() * (
+            -10000.0)  # 超出窗口范围的部分赋予极小值 (mask positions outside the window)
+        attn = attn + sparse_mask.unsqueeze(0).unsqueeze(0)  # 广播至 [B, num_heads, N, N]
+
+        attn = torch.softmax(attn, dim=-1)
+        attn = self.attn_drop(attn)
+        out = torch.matmul(attn, v)  # [B, num_heads, N, head_dim]
+        out = out.transpose(1, 2).reshape(B, N, -1)
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        return out
+
+
+''' SkateFormer Block 模块修改版：用稀疏自注意力替换原有的 Skate-MSA (SkateFormer Block with Sparse Self-Attention) '''
+
+
+class SkateFormerBlock(nn.Module):
+    def __init__(self, in_channels, num_points=50, kernel_size=7, num_heads=32,
+                 attn_drop=0., drop=0., rel=True, drop_path=0., mlp_ratio=4.,
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+        """
+        in_channels: 输入通道数 (input channels)
+        num_points: 关键点数 (number of points)
+        kernel_size: 卷积核大小 (kernel size)
+        num_heads: 注意力头数 (number of attention heads)
+        其他参数同 Transformer 相关模块 (other parameters similar to Transformer blocks)
+        """
+        super(SkateFormerBlock, self).__init__()
+        self.norm_1 = norm_layer(in_channels)
+        self.mapping = nn.Linear(in_features=in_channels, out_features=2 * in_channels, bias=True)
+        # G-Conv 参数 (G-Conv parameters)
+        self.gconv = nn.Parameter(torch.zeros(num_heads // (2 * 2), num_points, num_points))
+        trunc_normal_(self.gconv, std=.02)
+        self.tconv = nn.Conv2d(in_channels // (2 * 2), in_channels // (2 * 2), kernel_size=(kernel_size, 1),
+                               padding=((kernel_size - 1) // 2, 0), groups=num_heads // (2 * 2))
+
+        # 使用稀疏自注意力替换原有的 Skate-MSA 模块 (Replace Skate-MSA with Sparse Self-Attention)
+        # 原来 f_attn 分支通道数为 3 * in_channels // 2
+        self.sparse_attn = SparseSelfAttention(in_channels=(3 * in_channels) // 2, num_heads=num_heads, window_size=7,
+                                               attn_drop=attn_drop)
+
+        self.proj = nn.Linear(in_features=in_channels, out_features=in_channels, bias=True)
+        self.proj_drop = nn.Dropout(p=drop)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm_2 = norm_layer(in_channels)
+        self.mlp = Mlp(in_features=in_channels, hidden_features=int(mlp_ratio * in_channels),
+                       act_layer=act_layer, drop=drop)
+
+        # 标量权重 (scalar weights for different branches)
+        self.alpha_attn = nn.Parameter(torch.ones(1))
+        self.alpha_GConv = nn.Parameter(torch.ones(1))
+        self.alpha_TConv = nn.Parameter(torch.ones(1))
+
+    def forward(self, input):
+        # input shape: [B, C, T, V]
+        B, C, T, V = input.shape
+        # 调整维度至 [B, T, V, C]
+        input_permuted = input.permute(0, 2, 3, 1).contiguous()
+        skip = input_permuted  # 残差连接 (residual connection)
+
+        # 归一化 + 线性映射 (Normalization + linear mapping)
+        f = self.mapping(self.norm_1(input_permuted)).permute(0, 3, 1, 2).contiguous()  # [B, 2*C, T, V]
+        # 分离出两个分支：f_conv 用于 G-Conv 和 T-Conv，f_attn 用于稀疏自注意力
+        f_conv, f_attn = torch.split(f, [C // 2, (3 * C) // 2], dim=1)
+
+        y = []
+        # G-Conv 分支 (G-Conv branch)
+        split_f_conv = torch.chunk(f_conv, 2, dim=1)
+        y_gconv = []
+        split_f_gconv = torch.chunk(split_f_conv[0], self.gconv.shape[0], dim=1)
+        for i in range(self.gconv.shape[0]):
+            z = torch.einsum('n c t u, v u -> n c t v', split_f_gconv[i], self.gconv[i])
+            y_gconv.append(z)
+        y.append(torch.cat(y_gconv, dim=1) * self.alpha_GConv)
+
+        # T-Conv 分支 (T-Conv branch)
+        y.append(self.tconv(split_f_conv[1]) * self.alpha_TConv)
+
+        # 稀疏自注意力分支 (Sparse Self-Attention branch)
+        # 将 f_attn 重塑为 [B, T*V, 3*C//2]
+        f_attn_flat = f_attn.view(B, (3 * C) // 2, T * V).permute(0, 2, 1).contiguous()
+        attn_out = self.sparse_attn(f_attn_flat)  # 输出形状: [B, T*V, 3*C//2]
+        attn_out = attn_out.permute(0, 2, 1).contiguous().view(B, C // 2, T, V)
+        y.append(self.alpha_attn * attn_out)
+
+        # 融合各分支 (Fusion of branches)
+        output = self.proj(torch.cat(y, dim=1).permute(0, 2, 3, 1).contiguous())
+        output = self.proj_drop(output)
+        output = skip + self.drop_path(output)
+
+        # 前馈网络 (Feed Forward Network)
+        output = output + self.drop_path(self.mlp(self.norm_2(output)))
+        output = output.permute(0, 3, 1, 2).contiguous()
+        return output
+
+
+''' 以下模块保持不变，可直接用于构造下采样、Stage、Stem 以及整体模型 SkateFormer '''
+
+''' Downsampling '''
+
+
+class PatchMergingTconv(nn.Module):
+    def __init__(self, dim_in, dim_out, kernel_size=7, stride=2, dilation=1):
+        super().__init__()
+        self.dim_in = dim_in
+        self.dim_out = dim_out
+        pad = (kernel_size + (kernel_size - 1) * (dilation - 1) - 1) // 2
+        self.reduction = nn.Conv2d(dim_in, dim_out, kernel_size=(kernel_size, 1), padding=(pad, 0), stride=(stride, 1),
+                                   dilation=(dilation, 1))
+        self.bn = nn.BatchNorm2d(dim_out)
+
+    def forward(self, x):
+        x = self.bn(self.reduction(x))
+        return x
+
+
+''' SkateFormer Block with Downsampling '''
+
+
+class SkateFormerBlockDS(nn.Module):
+    def __init__(
+            self, in_channels, out_channels, num_points=50, kernel_size=7, downscale=False, num_heads=32,
+            type_1_size=(1, 1), type_2_size=(1, 1), type_3_size=(1, 1), type_4_size=(1, 1),
+            attn_drop=0., drop=0., rel=True, drop_path=0., mlp_ratio=4.,
+            act_layer=nn.GELU, norm_layer_transformer=nn.LayerNorm):
+        super(SkateFormerBlockDS, self).__init__()
+
+        if downscale:
+            self.downsample = PatchMergingTconv(in_channels, out_channels, kernel_size=kernel_size)
+        else:
+            self.downsample = None
+
+        self.transformer = SkateFormerBlock(
+            in_channels=out_channels,
+            num_points=num_points,
+            kernel_size=kernel_size,
+            num_heads=num_heads,
+            # type_1_size=type_1_size,
+            # type_2_size=type_2_size,
+            # type_3_size=type_3_size,
+            # type_4_size=type_4_size,
+            attn_drop=attn_drop,
+            drop=drop,
+            rel=rel,
+            drop_path=drop_path,
+            mlp_ratio=mlp_ratio,
+            act_layer=act_layer,
+            norm_layer=norm_layer_transformer,
+        )
+
+    def forward(self, input):
+        if self.downsample is not None:
+            output = self.transformer(self.downsample(input))
+        else:
+            output = self.transformer(input)
+        return output
+
+
+''' SkateFormer Stage '''
+
+
+class SkateFormerStage(nn.Module):
+    def __init__(
+            self, depth, in_channels, out_channels, first_depth=False,
+            num_points=50, kernel_size=7, num_heads=32,
+            type_1_size=(1, 1), type_2_size=(1, 1), type_3_size=(1, 1), type_4_size=(1, 1),
+            attn_drop=0., drop=0., rel=True, drop_path=0., mlp_ratio=4.,
+            act_layer=nn.GELU, norm_layer_transformer=nn.LayerNorm):
+        super(SkateFormerStage, self).__init__()
+        blocks = []
+        for index in range(depth):
+            blocks.append(
+                SkateFormerBlockDS(
+                    in_channels=in_channels if index == 0 else out_channels,
+                    out_channels=out_channels,
+                    num_points=num_points,
+                    kernel_size=kernel_size,
+                    downscale=((index == 0) & ~first_depth),
+                    num_heads=num_heads,
+                    type_1_size=type_1_size,
+                    type_2_size=type_2_size,
+                    type_3_size=type_3_size,
+                    type_4_size=type_4_size,
+                    attn_drop=attn_drop,
+                    drop=drop,
+                    rel=rel,
+                    drop_path=drop_path if isinstance(drop_path, float) else drop_path[index],
+                    mlp_ratio=mlp_ratio,
+                    act_layer=act_layer,
+                    norm_layer_transformer=norm_layer_transformer))
+        self.blocks = nn.ModuleList(blocks)
+
+    def forward(self, input):
+        output = input
+        for block in self.blocks:
+            output = block(output)
+        return output
+
+
+''' SkateFormer '''
+
+
+class StemBlock(nn.Module):
+    def __init__(self, in_channels: int, embed_dim: int):
+        super(StemBlock, self).__init__()
+        # 初始1×1卷积降低通道维度 (1×1 conv for channel reduction)
+        self.conv_init = nn.Sequential(
+            nn.Conv2d(in_channels, embed_dim // 2, kernel_size=1, bias=False),
+            nn.BatchNorm2d(embed_dim // 2),
+            nn.GELU()
+        )
+        # 时域分支：沿时间方向进行深度可分离卷积 (Temporal branch: depthwise conv along time)
+        self.temporal_branch = nn.Sequential(
+            nn.Conv2d(embed_dim // 2, embed_dim // 2, kernel_size=(3, 1), stride=1, padding=(1, 0),
+                      groups=embed_dim // 2, bias=False),
+            nn.BatchNorm2d(embed_dim // 2),
+            nn.GELU()
+        )
+        # 空间分支：沿关节方向进行深度可分离卷积 (Spatial branch: depthwise conv along joint/spatial dimension)
+        self.spatial_branch = nn.Sequential(
+            nn.Conv2d(embed_dim // 2, embed_dim // 2, kernel_size=(1, 3), stride=1, padding=(0, 1),
+                      groups=embed_dim // 2, bias=False),
+            nn.BatchNorm2d(embed_dim // 2),
+            nn.GELU()
+        )
+        # 融合两分支的特征 (Fusion)
+        self.fuse = nn.Sequential(
+            nn.Conv2d(embed_dim, embed_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(embed_dim),
+            nn.GELU()
+        )
+
+    def forward(self, x):
+        # x shape: [B, in_channels, T, V]
+        x = self.conv_init(x)  # 输出 shape: [B, embed_dim//2, T, V]
+        t_feat = self.temporal_branch(x)  # 时域特征
+        s_feat = self.spatial_branch(x)  # 空间特征
+        # 拼接两个分支的特征 (concatenate along channel dimension)
+        concat_feat = torch.cat([t_feat, s_feat], dim=1)  # shape: [B, embed_dim, T, V]
+        out = self.fuse(concat_feat)
+        return out
+
+
+class SkateFormer(nn.Module):
+    def __init__(self, in_channels=2, depths=(2, 2, 2, 2), channels=(96, 192, 192, 192), num_classes=60,
+                 coarse_classes=7,
+                 embed_dim=64, num_people=2, num_frames=64, num_points=50, kernel_size=7, num_heads=32,
+                 type_1_size=(1, 1), type_2_size=(1, 1), type_3_size=(1, 1), type_4_size=(1, 1),
+                 attn_drop=0., head_drop=0., drop=0., rel=True, drop_path=0., mlp_ratio=4.,
+                 act_layer=nn.GELU, norm_layer_transformer=nn.LayerNorm, index_t=False, global_pool='avg',
+                 projection_dim=128):
+
+        super(SkateFormer, self).__init__()
+
+        assert len(depths) == len(channels), "For each stage a channel dimension must be given."
+        assert global_pool in ["avg", "max"], f"Only avg and max is supported but {global_pool} is given"
+        self.num_classes: int = num_classes
+        self.head_drop = head_drop
+        self.index_t = index_t
+        self.embed_dim = embed_dim
+
+        if self.head_drop != 0:
+            self.dropout = nn.Dropout(p=self.head_drop)
+        else:
+            self.dropout = None
+
+        self.stem = StemBlock(in_channels, embed_dim)
+
+        if self.index_t:
+            self.joint_person_embedding = nn.Parameter(torch.zeros(embed_dim, num_points * num_people))
+            trunc_normal_(self.joint_person_embedding, std=.02)
+        else:
+            self.joint_person_temporal_embedding = nn.Parameter(
+                torch.zeros(1, embed_dim, num_frames, num_points * num_people))
+            trunc_normal_(self.joint_person_temporal_embedding, std=.02)
+
+        # Init blocks
+        drop_path = torch.linspace(0.0, drop_path, sum(depths)).tolist()
+        stages = []
+        for index, (depth, channel) in enumerate(zip(depths, channels)):
+            stages.append(
+                SkateFormerStage(
+                    depth=depth,
+                    in_channels=embed_dim if index == 0 else channels[index - 1],
+                    out_channels=channel,
+                    first_depth=index == 0,
+                    num_points=num_points * num_people,
+                    kernel_size=kernel_size,
+                    num_heads=num_heads,
+                    type_1_size=type_1_size,
+                    type_2_size=type_2_size,
+                    type_3_size=type_3_size,
+                    type_4_size=type_4_size,
+                    attn_drop=attn_drop,
+                    drop=drop,
+                    rel=rel,
+                    drop_path=drop_path[sum(depths[:index]):sum(depths[:index + 1])],
+                    mlp_ratio=mlp_ratio,
+                    act_layer=act_layer,
+                    norm_layer_transformer=norm_layer_transformer
+                )
+            )
+        self.stages = nn.ModuleList(stages)
+        self.global_pool: str = global_pool
+
+        self.head = nn.Linear(channels[-1], num_classes)
+        self.coarse_stem_head = nn.Linear(embed_dim, coarse_classes)
+        self.coarse_heads = nn.ModuleList([nn.Linear(c, coarse_classes) for c in channels])
+
+        self.projection_head = nn.Sequential(
+            nn.Linear(channels[-1], channels[-1]),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels[-1], projection_dim)
+        )
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        nwd = set()
+        for n, _ in self.named_parameters():
+            if "relative_position_bias_table" in n:
+                nwd.add(n)
+        return nwd
+
+    def reset_classifier(self, num_classes, global_pool=None):
+        self.num_classes: int = num_classes
+        if global_pool is not None:
+            self.global_pool = global_pool
+        self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
+
+    def forward_features(self, input):
+        output = input
+        coarse_heads = []
+        for stage, coarse in zip(self.stages, self.coarse_heads):
+            output = stage(output)
+            coarse_heads.append(coarse(output.mean(dim=(2, 3))))
+        return output, coarse_heads
+
+    def forward_head(self, input, pre_logits=False):
+        if self.global_pool == "avg":
+            input = input.mean(dim=(2, 3))
+        elif self.global_pool == "max":
+            input = torch.amax(input, dim=(2, 3))
+        if self.dropout is not None:
+            input = self.dropout(input)
+        return input if pre_logits else self.head(input), input
+
+    def forward_data(self, input, index_t):
+        B, C, T, V, M = input.shape
+
+        output = input.permute(0, 1, 2, 4, 3).contiguous().view(B, C, T, -1)  # [B, C, T, M * V]
+
+        output = self.stem(output)
+        coarse_stem_head = self.coarse_stem_head(output.mean(dim=(2, 3)))
+
+        if self.index_t:
+            te = torch.zeros(B, T, self.embed_dim).to(output.device)  # B, T, C
+            div_term = torch.exp(
+                (torch.arange(0, self.embed_dim, 2, dtype=torch.float) * -(math.log(10000.0) / self.embed_dim))).to(
+                output.device)
+            te[:, :, 0::2] = torch.sin(index_t.unsqueeze(-1).float() * div_term)
+            te[:, :, 1::2] = torch.cos(index_t.unsqueeze(-1).float() * div_term)
+            output = output + torch.einsum('b t c, c v -> b c t v', te, self.joint_person_embedding)
+        else:
+            output = output + self.joint_person_temporal_embedding
+
+        return output, coarse_stem_head
+
+    def forward(self, input, index_t):
+        output, coarse_stem_head = self.forward_data(input, index_t)
+        output, coarse_heads = self.forward_features(output)
+
+        output_forward_head, output_pooling = self.forward_head(output)
+        output_projection_head = self.projection_head(output_pooling)
+        return output_forward_head, output_projection_head, [coarse_stem_head]+coarse_heads
+
+
+def SkateFormer_(**kwargs):
+    return SkateFormer(
+        depths=(3, 3, 3, 3),
+        channels=(96, 192, 192, 192),
+        embed_dim=96,
+        **kwargs
+    )
+#
+# def SkateFormer_(**kwargs):
+#     return SkateFormer(
+#         depths=(3, 4, 6, 3),
+#         channels=(128, 256, 256, 256),
+#         embed_dim=128,
+#         **kwargs
+#     )
