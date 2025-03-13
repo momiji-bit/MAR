@@ -1,5 +1,5 @@
 # MAR
-**Medical Dermatology Research on LLM-Based Question-Answering**, 12/2024 - present
+**Research on Skeleton-Based Micro-Action Recognition**, 10/2024 - present
 
 _Researcher_
 
